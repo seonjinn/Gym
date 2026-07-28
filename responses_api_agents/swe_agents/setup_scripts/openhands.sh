@@ -8,6 +8,7 @@ miniforge_dir=$MINIFORGE_DIR
 openhands_dir=$OPENHANDS_DIR
 agent_framework_repo=$AGENT_FRAMEWORK_REPO
 agent_framework_commit=$AGENT_FRAMEWORK_COMMIT
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 cd $setup_dir
 
@@ -52,7 +53,8 @@ $miniforge_dir/bin/python -m pip install -q 'packaging==26.0'
 # Install jq as a static binary (avoid conda solver changing other package versions)
 if [ ! -f "$miniforge_dir/bin/jq" ]; then
     echo "Installing jq static binary..."
-    curl -fsSL https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64 -o "$miniforge_dir/bin/jq"
+    jq_arch="$(bash "$script_dir/resolve_jq_arch.sh")"
+    curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-$jq_arch" -o "$miniforge_dir/bin/jq"
     chmod +x "$miniforge_dir/bin/jq"
 fi
 
