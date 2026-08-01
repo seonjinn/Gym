@@ -25,6 +25,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import sys
 import time
 import uuid
@@ -210,6 +211,7 @@ class SWEBenchWrapperServerConfig(BaseModel):
     run_session_id: str
     base_results_dir: Path
     openhands_setup_dir: Optional[Path] = None
+    openhands_runtime_contract_id: Optional[str] = None
     opencode_setup_dir: Optional[Path] = None
 
 
@@ -222,7 +224,6 @@ class ExecuteContainerCommandArgs(BaseModel):
 
 class SWEBenchWrapperInstanceConfig(SWEBenchWrapperServerConfig, SWEBenchWrapperConfig):
     node_local_openhands_setup_dir: Optional[Path] = None
-    openhands_runtime_identity: Optional[str] = None
     metrics_fpath: Path
     problem_info: Dict[str, Any]
     body: NeMoGymResponseCreateParamsNonStreaming
@@ -359,7 +360,7 @@ def file_lock(file_path: Path, label: str, max_wait: float = 3600.0, poll_interv
         shutil.rmtree(lock_path, ignore_errors=True)
 
 
-_OPENHANDS_RUNTIME_IDENTITY_FILES = (
+_OPENHANDS_RUNTIME_CONTRACT_FILES = (
     Path("OpenHands/.venv/pyvenv.cfg"),
     Path("OpenHands/.venv/bin/python"),
     Path("OpenHands/pyproject.toml"),
@@ -367,10 +368,46 @@ _OPENHANDS_RUNTIME_IDENTITY_FILES = (
     Path("OpenHands/uv.lock"),
     Path("miniforge3/conda-meta/history"),
 )
+_OPENHANDS_GIT_DIRT_EXCLUDED_PATHS = (
+    ".venv",
+    ".eval_sessions",
+    "logs",
+    "evaluation/oh",
+)
+_OPENHANDS_DISTRIBUTION_METADATA_FILES = (
+    "RECORD",
+    "METADATA",
+    "direct_url.json",
+    "INSTALLER",
+    "entry_points.txt",
+    "top_level.txt",
+)
+_OPENHANDS_INSTALLED_CONTENT_SUFFIXES = {
+    ".cfg",
+    ".egg-link",
+    ".ini",
+    ".json",
+    ".pth",
+    ".py",
+    ".pyi",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+_OPENHANDS_INSTALLED_CONTENT_MAX_BYTES = 256 * 1024
 
 
-def _get_openhands_runtime_identity(source_dir: Path) -> str:
-    openhands_dir = source_dir / "OpenHands"
+def _is_openhands_git_dirt_excluded_path(path: str) -> bool:
+    normalized_path = path.rstrip("/")
+    return any(
+        normalized_path == excluded_path or normalized_path.startswith(f"{excluded_path}/")
+        for excluded_path in _OPENHANDS_GIT_DIRT_EXCLUDED_PATHS
+    )
+
+
+def _get_clean_openhands_git_commit(openhands_dir: Path) -> Optional[str]:
     try:
         result = subprocess_run(
             ["git", "-C", str(openhands_dir), "rev-parse", "HEAD"],
@@ -378,41 +415,167 @@ def _get_openhands_runtime_identity(source_dir: Path) -> str:
             capture_output=True,
             text=True,
         )
-        git_commit = result.stdout.strip() if result.returncode == 0 else None
+        if result.returncode != 0:
+            return None
+        git_commit = result.stdout.strip()
+
+        dirty_paths: set[str] = set()
+        for git_args in (
+            ["diff", "--name-only", "-z", "HEAD", "--"],
+            ["diff", "--cached", "--name-only", "-z", "HEAD", "--"],
+            ["ls-files", "--others", "--exclude-standard", "--directory", "-z"],
+        ):
+            dirty_result = subprocess_run(
+                ["git", "-C", str(openhands_dir), *git_args],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if dirty_result.returncode != 0:
+                raise RuntimeError(f"Failed to inspect OpenHands Git tree with {' '.join(git_args)}")
+            dirty_paths.update(path for path in dirty_result.stdout.split("\x00") if path)
     except OSError:
-        git_commit = None
+        return None
+
+    relevant_dirty_paths = sorted(path for path in dirty_paths if not _is_openhands_git_dirt_excluded_path(path))
+    if relevant_dirty_paths:
+        preview = ", ".join(relevant_dirty_paths[:5])
+        raise RuntimeError(f"OpenHands Git tree is not clean: {preview}")
+    return git_commit
+
+
+def _hash_openhands_contract_path(runtime_hasher: Any, source_dir: Path, path: Path, *, include_content: bool) -> None:
+    try:
+        relative_path = path.relative_to(source_dir)
+    except ValueError:
+        raise RuntimeError(f"Runtime contract path escapes OpenHands setup: {path}") from None
+    runtime_hasher.update(str(relative_path).encode())
+    runtime_hasher.update(b"\x00")
+    try:
+        path_stat = path.lstat()
+    except OSError:
+        runtime_hasher.update(b"missing\x00")
+        return
+    runtime_hasher.update(f"{path_stat.st_mode & 0o777:o}:{path_stat.st_size}:{path_stat.st_mtime_ns}".encode())
+    runtime_hasher.update(b"\x00")
+    if path.is_symlink():
+        runtime_hasher.update(b"symlink\x00")
+        runtime_hasher.update(os.readlink(path).encode())
+        return
+    if not path.is_file():
+        runtime_hasher.update(b"non-file\x00")
+        return
+    runtime_hasher.update(b"file\x00")
+    if not include_content:
+        return
+    try:
+        with path.open("rb") as file:
+            while chunk := file.read(1024 * 1024):
+                runtime_hasher.update(chunk)
+    except OSError as error:
+        raise RuntimeError(f"Failed to fingerprint OpenHands runtime metadata {path}: {error}") from error
+
+
+def _hash_unversioned_openhands_source(runtime_hasher: Any, source_dir: Path) -> None:
+    openhands_dir = source_dir / "OpenHands"
+    if not openhands_dir.is_dir():
+        runtime_hasher.update(b"openhands-source-missing\x00")
+        return
+
+    for root, directories, files in os.walk(openhands_dir):
+        root_path = Path(root)
+        relative_root = root_path.relative_to(openhands_dir)
+        excluded_directories = {".git", ".venv", ".eval_sessions", "logs", "node_modules", "__pycache__"}
+        if relative_root == Path("evaluation"):
+            excluded_directories.add("oh")
+        directories[:] = sorted(directory for directory in directories if directory not in excluded_directories)
+        for filename in sorted(files):
+            _hash_openhands_contract_path(
+                runtime_hasher,
+                source_dir,
+                root_path / filename,
+                include_content=True,
+            )
+
+
+def _hash_openhands_installed_site_packages(runtime_hasher: Any, source_dir: Path, site_packages_dir: Path) -> None:
+    runtime_hasher.update(f"site-packages:{site_packages_dir.relative_to(source_dir)}".encode())
+    runtime_hasher.update(b"\x00")
+    for root, directories, files in os.walk(site_packages_dir):
+        root_path = Path(root)
+        directories.sort()
+        files.sort()
+        for directory in directories:
+            _hash_openhands_contract_path(
+                runtime_hasher,
+                source_dir,
+                root_path / directory,
+                include_content=False,
+            )
+        for filename in files:
+            path = root_path / filename
+            try:
+                path_stat = path.lstat()
+            except OSError:
+                include_content = False
+            else:
+                include_content = path_stat.st_size <= _OPENHANDS_INSTALLED_CONTENT_MAX_BYTES and (
+                    path.suffix in _OPENHANDS_INSTALLED_CONTENT_SUFFIXES
+                    or path.name in _OPENHANDS_DISTRIBUTION_METADATA_FILES
+                )
+            _hash_openhands_contract_path(
+                runtime_hasher,
+                source_dir,
+                path,
+                include_content=include_content,
+            )
+
+
+def _compute_openhands_runtime_contract_id(source_dir: Path) -> str:
+    """Identify source and installed metadata that must remain stable while staging.
+
+    Git-managed source must be clean outside the managed venv/output paths. The
+    installed environment is represented by a recursive metadata inventory plus
+    bounded source/metadata content, venv configuration, and conda metadata rather
+    than hashing all multi-GB payload bytes.
+    """
+    openhands_dir = source_dir / "OpenHands"
+    git_commit = _get_clean_openhands_git_commit(openhands_dir)
 
     runtime_hasher = hashlib.sha256()
-    for relative_path in _OPENHANDS_RUNTIME_IDENTITY_FILES:
-        path = source_dir / relative_path
-        runtime_hasher.update(str(relative_path).encode())
+    runtime_hasher.update(b"openhands-runtime-contract-v2\x00")
+    if git_commit is None:
+        _hash_unversioned_openhands_source(runtime_hasher, source_dir)
+    else:
+        runtime_hasher.update(f"git:{git_commit}".encode())
         runtime_hasher.update(b"\x00")
-        try:
-            path_stat = path.lstat()
-        except OSError:
-            runtime_hasher.update(b"missing\x00")
-            continue
-        runtime_hasher.update(f"{path_stat.st_mode & 0o777:o}".encode())
-        runtime_hasher.update(b"\x00")
-        if path.is_symlink():
-            runtime_hasher.update(b"symlink\x00")
-            runtime_hasher.update(os.readlink(path).encode())
-            continue
-        if not path.is_file():
-            runtime_hasher.update(b"non-file\x00")
-            continue
-        runtime_hasher.update(b"file\x00")
-        try:
-            with path.open("rb") as file:
-                while chunk := file.read(1024 * 1024):
-                    runtime_hasher.update(chunk)
-        except OSError:
-            runtime_hasher.update(b"unreadable\x00")
+
+    for relative_path in _OPENHANDS_RUNTIME_CONTRACT_FILES:
+        _hash_openhands_contract_path(
+            runtime_hasher,
+            source_dir,
+            source_dir / relative_path,
+            include_content=True,
+        )
+
+    venv_dir = openhands_dir / ".venv"
+    for site_packages_dir in sorted((venv_dir / "lib").glob("python*/site-packages")):
+        _hash_openhands_installed_site_packages(runtime_hasher, source_dir, site_packages_dir)
+
+    conda_meta_dir = source_dir / "miniforge3" / "conda-meta"
+    if conda_meta_dir.is_dir():
+        for conda_metadata_path in sorted(conda_meta_dir.glob("*.json")):
+            _hash_openhands_contract_path(
+                runtime_hasher,
+                source_dir,
+                conda_metadata_path,
+                include_content=True,
+            )
 
     runtime_digest = runtime_hasher.hexdigest()
     if git_commit is not None:
-        return f"git:{git_commit}:runtime:{runtime_digest}"
-    return f"runtime:{runtime_digest}"
+        return f"v2:git:{git_commit}:installed-state:{runtime_digest}"
+    return f"v2:source-content:installed-state:{runtime_digest}"
 
 
 def _rewrite_openhands_paths(staged_dir: Path, source_dir: Path) -> None:
@@ -453,16 +616,37 @@ def _rewrite_openhands_paths(staged_dir: Path, source_dir: Path) -> None:
 
 def _read_openhands_stage_manifest(destination_dir: Path) -> Optional[dict[str, Any]]:
     try:
+        if not stat.S_ISDIR(destination_dir.lstat().st_mode):
+            return None
         manifest = json.loads((destination_dir / ".nemo_gym_stage.json").read_text())
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return None
     return manifest if isinstance(manifest, dict) else None
 
 
-def _stage_openhands_setup(source_dir: Path, destination_dir: Path, runtime_identity: str) -> Path:
+def _remove_openhands_stage_destination(destination_dir: Path) -> None:
+    try:
+        destination_mode = destination_dir.lstat().st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(destination_mode):
+        shutil.rmtree(destination_dir)
+    else:
+        destination_dir.unlink()
+
+
+def _require_openhands_runtime_contract(source_dir: Path, expected_contract_id: str, change_phase: str) -> None:
+    actual_contract_id = _compute_openhands_runtime_contract_id(source_dir)
+    if actual_contract_id != expected_contract_id:
+        raise RuntimeError(
+            f"OpenHands runtime changed {change_phase}: expected {expected_contract_id}, found {actual_contract_id}"
+        )
+
+
+def _stage_openhands_setup(source_dir: Path, destination_dir: Path, runtime_contract_id: str) -> Path:
     expected_manifest = {
         "schema": 1,
-        "runtime_identity": runtime_identity,
+        "runtime_contract_id": runtime_contract_id,
         "container_root": "/openhands_setup",
     }
     if _read_openhands_stage_manifest(destination_dir) == expected_manifest:
@@ -474,6 +658,7 @@ def _stage_openhands_setup(source_dir: Path, destination_dir: Path, runtime_iden
 
         temporary_dir = destination_dir.with_name(f".{destination_dir.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
         try:
+            _require_openhands_runtime_contract(source_dir, runtime_contract_id, "before staging")
             shutil.copytree(source_dir, temporary_dir, symlinks=True)
             _rewrite_openhands_paths(temporary_dir, source_dir)
             for relative_output_dir in (
@@ -484,8 +669,9 @@ def _stage_openhands_setup(source_dir: Path, destination_dir: Path, runtime_iden
                 output_dir = temporary_dir / relative_output_dir
                 shutil.rmtree(output_dir, ignore_errors=True)
                 output_dir.mkdir(parents=True)
+            _require_openhands_runtime_contract(source_dir, runtime_contract_id, "during staging")
             (temporary_dir / ".nemo_gym_stage.json").write_text(json.dumps(expected_manifest, sort_keys=True))
-            shutil.rmtree(destination_dir, ignore_errors=True)
+            _remove_openhands_stage_destination(destination_dir)
             os.replace(temporary_dir, destination_dir)
         finally:
             shutil.rmtree(temporary_dir, ignore_errors=True)
@@ -2309,13 +2495,12 @@ def runner_ray_remote(params_dict: dict[str, Any]) -> Optional[Path]:
     if params.agent_framework == "openhands" and params.node_local_openhands_setup_dir is not None:
         if params.openhands_setup_dir is None:
             raise ValueError("Shared OpenHands setup directory is not set")
-        runtime_identity = params.openhands_runtime_identity or _get_openhands_runtime_identity(
-            params.openhands_setup_dir
-        )
+        if params.openhands_runtime_contract_id is None:
+            raise ValueError("OpenHands runtime contract ID is not initialized")
         _stage_openhands_setup(
             params.openhands_setup_dir,
             params.node_local_openhands_setup_dir,
-            runtime_identity,
+            params.openhands_runtime_contract_id,
         )
     run_oh = RunOpenHandsAgent(config=params)
     report_file = asyncio.run(run_oh.process_single_datapoint())
@@ -2926,10 +3111,13 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         # Only set up the agent harness that's actually selected. Both share the
         # same dataset/eval setup paths.
         openhands_setup_dir, opencode_setup_dir = None, None
+        openhands_runtime_contract_id = None
         if self.config.agent_framework == "opencode":
             opencode_setup_dir = OpenCodeHarnessProcessor(config=self.config).setup()
         else:
             openhands_setup_dir = OpenHandsHarnessProcessor(config=self.config).setup()
+            if self.config.openhands_node_local_staging:
+                openhands_runtime_contract_id = _compute_openhands_runtime_contract_id(openhands_setup_dir)
 
         self._swe_bench_wrapper_server_config = SWEBenchWrapperServerConfig(
             run_session_id=run_session_id,
@@ -2937,6 +3125,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             ng_global_config_dict_str=shlex.quote(OmegaConf.to_yaml(get_global_config_dict())),
             model_server_name=self.config.model_server.name,
             openhands_setup_dir=openhands_setup_dir,
+            openhands_runtime_contract_id=openhands_runtime_contract_id,
             opencode_setup_dir=opencode_setup_dir,
             swebench_setup_dir=SweBenchDatasetProcessor(config=self.config).setup(),
             swebench_multilingual_setup_dir=SweBenchMultilingualDatasetProcessor(config=self.config).setup(),
@@ -3537,6 +3726,9 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
     def _setup_params(
         self, body: NeMoGymResponseCreateParamsNonStreaming
     ) -> Tuple[SWEBenchWrapperInstanceConfig, BaseDatasetHarnessProcessor]:
+        server_config = self._swe_bench_wrapper_server_config
+        if server_config is None:
+            raise RuntimeError("SWE-bench wrapper server configuration is not initialized")
         problem_info = body.metadata | {"container_formatter": self.config.container_formatter}
         instance_id = problem_info.get("instance_id", "unknown")
 
@@ -3554,7 +3746,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
 
         # Create persistent directory for I/O and logs in local workspace
         instance_dir = f"{instance_id}_{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
-        persistent_dir = self._swe_bench_wrapper_server_config.base_results_dir / instance_dir
+        persistent_dir = server_config.base_results_dir / instance_dir
         persistent_dir.mkdir(parents=True, exist_ok=True)
 
         agent_run_id = f"{instance_id}_{int(time.time())}_{str(uuid.uuid4())[:8]}"
@@ -3608,7 +3800,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
 
         params: SWEBenchWrapperInstanceConfig = SWEBenchWrapperInstanceConfig(
             **self.config.model_dump(),
-            **self._swe_bench_wrapper_server_config.model_dump(),
+            **server_config.model_dump(),
             problem_info=problem_info,
             body=body,
             persistent_dir=persistent_dir,
@@ -3641,10 +3833,11 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         if params.agent_framework == "openhands" and params.openhands_node_local_staging:
             if params.openhands_setup_dir is None:
                 raise ValueError("Shared OpenHands setup directory is not set")
-            params.openhands_runtime_identity = _get_openhands_runtime_identity(params.openhands_setup_dir)
-            job_scope = os.environ.get("SLURM_JOB_ID") or self._swe_bench_wrapper_server_config.run_session_id
+            if params.openhands_runtime_contract_id is None:
+                raise ValueError("OpenHands runtime contract ID is not initialized")
+            job_scope = os.environ.get("SLURM_JOB_ID") or server_config.run_session_id
             cache_key = hashlib.sha256(
-                f"{job_scope}:{params.openhands_runtime_identity}:{params.openhands_setup_dir}".encode()
+                f"{job_scope}:{params.openhands_runtime_contract_id}:{params.openhands_setup_dir}".encode()
             ).hexdigest()[:16]
             params.node_local_openhands_setup_dir = params.openhands_node_local_root / cache_key
 
