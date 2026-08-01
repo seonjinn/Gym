@@ -982,6 +982,21 @@ class TestOpenHandsHarnessProcessor:
             assert "timeout" in result.command
             assert "run_infer.sh" in self._read_agent_script(config)
 
+    def test_node_local_expected_output_path(self, tmp_path: Path) -> None:
+        shared = tmp_path / "shared"
+        local = tmp_path / "local"
+        config = _make_instance_config(
+            tmp_path,
+            openhands_setup_dir=shared,
+            node_local_openhands_setup_dir=local,
+        )
+        processor = OpenHandsHarnessProcessor(config=config)
+
+        result = processor.get_run_command()
+
+        assert result.expected_file_pattern.startswith(str(local / "OpenHands"))
+        assert str(shared / "OpenHands") not in result.expected_file_pattern
+
     def _read_agent_script(self, config) -> str:
         # The script is written at persistent_dir / agent_script_{agent_run_id}.sh
         script_path = config.persistent_dir / f"agent_script_{config.agent_run_id}.sh"
@@ -1652,6 +1667,29 @@ class TestRunOpenHandsAgent:
             assert result == str(agent.config.prediction_path)
             assert agent.config.prediction_path.exists()
 
+    def test_node_local_output_is_copied_and_cleaned_from_effective_dir(self, tmp_path: Path) -> None:
+        shared = tmp_path / "shared"
+        local = tmp_path / "local"
+        agent = self._make_agent(
+            tmp_path,
+            openhands_setup_dir=shared,
+            node_local_openhands_setup_dir=local,
+        )
+        local_eval_dir = local / "OpenHands" / agent.config.eval_dir_in_openhands
+        local_eval_dir.mkdir(parents=True)
+        (local_eval_dir / "output.jsonl").write_text('{"local": true}\n')
+        shared_eval_dir = shared / "OpenHands" / agent.config.eval_dir_in_openhands
+        shared_eval_dir.mkdir(parents=True)
+        shared_sentinel = shared_eval_dir / "keep.txt"
+        shared_sentinel.write_text("keep")
+
+        result = agent._openhands_dir_copy_from_host(output_file_path="output.jsonl")
+
+        assert result == str(agent.config.prediction_path)
+        assert agent.config.prediction_path.read_text() == '{"local": true}\n'
+        assert not local_eval_dir.exists()
+        assert shared_sentinel.read_text() == "keep"
+
     def test_openhands_dir_copy_from_host_relative_output_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             agent = self._make_agent(tmpdir)
@@ -2051,6 +2089,30 @@ class TestSWEBenchWrapperBuildApptainerCommand:
             assert "apptainer exec" in result
             assert "--writable-tmpfs" in result
             assert params.container in result
+
+    def test_node_local_mount_uses_effective_openhands_dir(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper = _create_wrapper(monkeypatch)
+        shared = tmp_path / "shared"
+        local = tmp_path / "local"
+        params = _make_instance_config(
+            tmp_path,
+            openhands_setup_dir=shared,
+            node_local_openhands_setup_dir=local,
+        )
+        for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
+            (local / "OpenHands" / subdir).mkdir(parents=True, exist_ok=True)
+        (local / "miniforge3").mkdir(parents=True)
+        command = ExecuteContainerCommandArgs(
+            command="echo hello",
+            expected_file_pattern="/tmp/*.json",
+            mode="agent",
+            timeout=300,
+        )
+
+        result = wrapper._build_apptainer_command(params, command)
+
+        assert f"src={local}/OpenHands,dst=/openhands_setup/OpenHands,ro" in result
+        assert f"src={shared}/OpenHands" not in result
 
     def test_eval_mode_swebench_mounts(self, monkeypatch) -> None:
         wrapper = _create_wrapper(monkeypatch)

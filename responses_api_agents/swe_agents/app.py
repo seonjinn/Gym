@@ -1869,7 +1869,7 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
         )
 
         search_path = os.path.join(
-            self.config.openhands_setup_dir / "OpenHands" / eval_dir_in_openhands,
+            self.config.effective_openhands_setup_dir / "OpenHands" / eval_dir_in_openhands,
             "**",
             "output.jsonl",
         )
@@ -2427,8 +2427,7 @@ class RunOpenHandsAgent(BaseModel):
             assert self.config.opencode_setup_dir is not None
             eval_dir_on_host = Path(self.config.opencode_setup_dir) / "opencode" / eval_dir_in_openhands
         else:
-            assert self.config.openhands_setup_dir is not None
-            eval_dir_on_host = Path(self.config.openhands_setup_dir) / "OpenHands" / eval_dir_in_openhands
+            eval_dir_on_host = self.config.effective_openhands_setup_dir / "OpenHands" / eval_dir_in_openhands
         trajectories_root = self.config.trajectories_root
         llm_completions_dir = trajectories_root / "llm_completions" / data_point["instance_id"]
         trajectories_root.mkdir(parents=True, exist_ok=True)
@@ -3232,8 +3231,8 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                 )
         else:
             # OpenHands path (default).
-            assert params.openhands_setup_dir is not None, "openhands_setup_dir not set"
-            openhands_dir = f"{params.openhands_setup_dir}/OpenHands"
+            openhands_setup_dir = params.effective_openhands_setup_dir
+            openhands_dir = f"{openhands_setup_dir}/OpenHands"
             mount_args.extend(
                 [
                     # Read-only base mounts (parent first)
@@ -3262,7 +3261,7 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                     f"--mount type=bind,src={params.resolved_system_prompt_template},dst=/openhands_setup/OpenHands/system_prompt_long_horizon.j2"
                 )
 
-            miniforge3_path = Path(params.openhands_setup_dir) / "miniforge3"
+            miniforge3_path = openhands_setup_dir / "miniforge3"
             mount_args.append(f"--mount type=bind,src={miniforge3_path},dst=/openhands_setup/miniforge3,ro")
             mount_args.append(f"--mount type=bind,src={miniforge3_path},dst={miniforge3_path},ro")
 
