@@ -484,6 +484,125 @@ class TestBaseDatasetHarnessProcessor:
                 pass  # should break the stale lock
 
 
+class TestNodeLocalOpenHandsStaging:
+    def test_stage_openhands_setup_rewrites_container_paths(self, tmp_path: Path) -> None:
+        source = tmp_path / "shared"
+        (source / "OpenHands" / ".venv" / "bin").mkdir(parents=True)
+        (source / "miniforge3" / "bin").mkdir(parents=True)
+        (source / "OpenHands" / ".venv" / "pyvenv.cfg").write_text(
+            f"home = {source}/miniforge3/bin\n"
+        )
+        (source / "OpenHands" / ".venv" / "bin" / "openhands").write_text(
+            f"#!{source}/OpenHands/.venv/bin/python\n"
+        )
+        destination = tmp_path / "local"
+
+        staged = swe_app._stage_openhands_setup(source, destination, "abc123")
+
+        assert staged == destination
+        assert "/openhands_setup/miniforge3/bin" in (
+            destination / "OpenHands" / ".venv" / "pyvenv.cfg"
+        ).read_text()
+        assert (destination / "OpenHands" / ".venv" / "bin" / "openhands").read_text().startswith(
+            "#!/openhands_setup/OpenHands/.venv/bin/python"
+        )
+
+    def test_stage_openhands_setup_cache_hit_skips_copy(self, monkeypatch, tmp_path: Path) -> None:
+        source = tmp_path / "shared"
+        source.mkdir()
+        destination = tmp_path / "local"
+        swe_app._stage_openhands_setup(source, destination, "abc123")
+        copytree = MagicMock(side_effect=AssertionError("cache hit copied the runtime"))
+        monkeypatch.setattr(swe_app.shutil, "copytree", copytree)
+
+        staged = swe_app._stage_openhands_setup(source, destination, "abc123")
+
+        assert staged == destination
+        copytree.assert_not_called()
+
+    def test_stage_openhands_setup_clears_outputs_only_on_fresh_stage(self, tmp_path: Path) -> None:
+        source = tmp_path / "shared"
+        output_dirs = [
+            Path("OpenHands/.eval_sessions"),
+            Path("OpenHands/logs"),
+            Path("OpenHands/evaluation/oh"),
+        ]
+        for relative_dir in output_dirs:
+            output_dir = source / relative_dir
+            output_dir.mkdir(parents=True)
+            (output_dir / "stale.txt").write_text("stale")
+        destination = tmp_path / "local"
+
+        swe_app._stage_openhands_setup(source, destination, "abc123")
+
+        for relative_dir in output_dirs:
+            assert list((destination / relative_dir).iterdir()) == []
+
+        live_output = destination / output_dirs[0] / "live.txt"
+        live_output.write_text("keep")
+        swe_app._stage_openhands_setup(source, destination, "abc123")
+        assert live_output.read_text() == "keep"
+
+    def test_stage_openhands_setup_rewrites_only_safe_runtime_paths(self, tmp_path: Path) -> None:
+        source = tmp_path / "shared"
+        bin_dir = source / "OpenHands" / ".venv" / "bin"
+        metadata_dir = source / "OpenHands" / ".venv" / "site-packages" / "pkg.dist-info"
+        target = source / "miniforge3" / "bin" / "python"
+        bin_dir.mkdir(parents=True)
+        metadata_dir.mkdir(parents=True)
+        target.parent.mkdir(parents=True)
+        target.write_text("python")
+        (bin_dir / "internal-python").symlink_to(target)
+        (bin_dir / "external-python").symlink_to("/opt/external/python")
+        (bin_dir / "relative-python").symlink_to("../../../miniforge3/bin/python")
+        escaped_target = f"{source}/miniforge3/../../outside/python"
+        (bin_dir / "escaped-python").symlink_to(escaped_target)
+        binary = b"\x00binary:" + str(source).encode()
+        (bin_dir / "binary-tool").write_bytes(binary)
+        untouched = source / "OpenHands" / "config.txt"
+        untouched.write_text(f"runtime={source}\n")
+        (metadata_dir / "direct_url.json").write_text(f'{{"url": "file://{source}/OpenHands"}}')
+        destination = tmp_path / "local"
+
+        swe_app._stage_openhands_setup(source, destination, "abc123")
+
+        staged_bin = destination / "OpenHands" / ".venv" / "bin"
+        assert os.readlink(staged_bin / "internal-python") == "/openhands_setup/miniforge3/bin/python"
+        assert os.readlink(staged_bin / "external-python") == "/opt/external/python"
+        assert os.readlink(staged_bin / "relative-python") == "../../../miniforge3/bin/python"
+        assert os.readlink(staged_bin / "escaped-python") == escaped_target
+        assert (staged_bin / "binary-tool").read_bytes() == binary
+        assert (destination / "OpenHands" / "config.txt").read_text() == f"runtime={source}\n"
+        assert "/openhands_setup/OpenHands" in (
+            destination / "OpenHands" / ".venv" / "site-packages" / "pkg.dist-info" / "direct_url.json"
+        ).read_text()
+
+    @pytest.mark.parametrize(
+        "manifest_content",
+        [
+            json.dumps({"schema": 1, "commit": "old", "container_root": "/openhands_setup"}),
+            "{invalid-json",
+        ],
+    )
+    def test_stage_openhands_setup_rebuilds_stale_or_invalid_manifest(
+        self, manifest_content: str, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "shared"
+        source.mkdir()
+        (source / "fresh.txt").write_text("fresh")
+        destination = tmp_path / "local"
+        destination.mkdir()
+        (destination / "stale.txt").write_text("stale")
+        (destination / ".nemo_gym_stage.json").write_text(manifest_content)
+
+        swe_app._stage_openhands_setup(source, destination, "new")
+
+        assert (destination / "fresh.txt").read_text() == "fresh"
+        assert not (destination / "stale.txt").exists()
+        manifest = json.loads((destination / ".nemo_gym_stage.json").read_text())
+        assert manifest["commit"] == "new"
+
+
 ########################################
 # NVInternalDatasetProcessor tests
 ########################################
@@ -1433,6 +1552,41 @@ class TestGetAllSessionTrajectories:
 class TestRunnerRayRemote:
     def test_is_ray_remote(self) -> None:
         assert hasattr(runner_ray_remote, "remote")
+
+    def test_stages_openhands_before_constructing_runner(self, monkeypatch, tmp_path: Path) -> None:
+        events: list[tuple] = []
+        shared = tmp_path / "shared"
+        local = tmp_path / "local"
+        params = _make_instance_config(
+            tmp_path,
+            openhands_setup_dir=shared,
+            node_local_openhands_setup_dir=local,
+            agent_framework_commit="abc123",
+        )
+
+        def fake_stage(source_dir: Path, destination_dir: Path, target_commit: str) -> Path:
+            events.append(("stage", source_dir, destination_dir, target_commit))
+            return destination_dir
+
+        class FakeRunOpenHandsAgent:
+            @classmethod
+            def model_rebuild(cls, force: bool) -> None:
+                assert force is True
+
+            def __init__(self, config: SWEBenchWrapperInstanceConfig) -> None:
+                events.append(("construct", config))
+
+            async def process_single_datapoint(self) -> Path:
+                return tmp_path / "report.json"
+
+        monkeypatch.setattr(swe_app, "_stage_openhands_setup", fake_stage)
+        monkeypatch.setattr(swe_app, "RunOpenHandsAgent", FakeRunOpenHandsAgent)
+
+        result = runner_ray_remote._function(params.model_dump(mode="python"))
+
+        assert result == tmp_path / "report.json"
+        assert events[0] == ("stage", shared, local, "abc123")
+        assert events[1][0] == "construct"
 
 
 ########################################

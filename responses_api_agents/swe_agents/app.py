@@ -358,6 +358,79 @@ def file_lock(file_path: Path, label: str, max_wait: float = 3600.0, poll_interv
         shutil.rmtree(lock_path, ignore_errors=True)
 
 
+def _rewrite_openhands_paths(staged_dir: Path, source_dir: Path) -> None:
+    source_prefix = str(source_dir)
+    normalized_source = Path(os.path.normpath(source_prefix))
+    for path in staged_dir.rglob("*"):
+        if path.is_symlink():
+            target = os.readlink(path)
+            if not Path(target).is_absolute():
+                continue
+            normalized_target = Path(os.path.normpath(target))
+            try:
+                relative_target = normalized_target.relative_to(normalized_source)
+            except ValueError:
+                continue
+            path.unlink()
+            path.symlink_to(Path("/openhands_setup") / relative_target)
+            continue
+        if not path.is_file():
+            continue
+        relative_parts = path.relative_to(staged_dir).parts
+        if not (
+            path.name in {"pyvenv.cfg", "direct_url.json", "RECORD"}
+            or path.suffix == ".pth"
+            or "bin" in relative_parts[:-1]
+        ):
+            continue
+        try:
+            raw_content = path.read_bytes()
+            if b"\x00" in raw_content:
+                continue
+            content = raw_content.decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if source_prefix in content:
+            path.write_text(content.replace(source_prefix, "/openhands_setup"))
+
+
+def _stage_openhands_setup(source_dir: Path, destination_dir: Path, target_commit: str) -> Path:
+    expected_manifest = {
+        "schema": 1,
+        "commit": target_commit,
+        "container_root": "/openhands_setup",
+    }
+    with file_lock(destination_dir, "node-local OpenHands staging"):
+        manifest_path = destination_dir / ".nemo_gym_stage.json"
+        try:
+            current_manifest = json.loads(manifest_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            current_manifest = None
+        if current_manifest == expected_manifest:
+            return destination_dir
+
+        temporary_dir = destination_dir.with_name(
+            f".{destination_dir.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        )
+        try:
+            shutil.copytree(source_dir, temporary_dir, symlinks=True)
+            _rewrite_openhands_paths(temporary_dir, source_dir)
+            for relative_output_dir in (
+                Path("OpenHands/.eval_sessions"),
+                Path("OpenHands/logs"),
+                Path("OpenHands/evaluation/oh"),
+            ):
+                output_dir = temporary_dir / relative_output_dir
+                shutil.rmtree(output_dir, ignore_errors=True)
+                output_dir.mkdir(parents=True)
+            (temporary_dir / ".nemo_gym_stage.json").write_text(json.dumps(expected_manifest, sort_keys=True))
+            shutil.rmtree(destination_dir, ignore_errors=True)
+            os.replace(temporary_dir, destination_dir)
+        finally:
+            shutil.rmtree(temporary_dir, ignore_errors=True)
+    return destination_dir
+
+
 class BaseDatasetHarnessProcessor(BaseModel):
     config: SWEBenchWrapperConfig | SWEBenchWrapperInstanceConfig
 
@@ -2172,6 +2245,14 @@ def runner_ray_remote(params_dict: dict[str, Any]) -> Optional[Path]:
     RunOpenHandsAgent.model_rebuild(force=True)
 
     params = SWEBenchWrapperInstanceConfig.model_validate(params_dict)
+    if params.agent_framework == "openhands" and params.node_local_openhands_setup_dir is not None:
+        if params.openhands_setup_dir is None:
+            raise ValueError("Shared OpenHands setup directory is not set")
+        _stage_openhands_setup(
+            params.openhands_setup_dir,
+            params.node_local_openhands_setup_dir,
+            params.agent_framework_commit,
+        )
     run_oh = RunOpenHandsAgent(config=params)
     report_file = asyncio.run(run_oh.process_single_datapoint())
 
