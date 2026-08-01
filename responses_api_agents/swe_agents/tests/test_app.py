@@ -18,6 +18,7 @@ import os
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -97,7 +98,7 @@ def _create_wrapper(monkeypatch) -> SWEBenchWrapper:
     return wrapper
 
 
-def _make_instance_config(tmpdir: str, **overrides) -> SWEBenchWrapperInstanceConfig:
+def _make_instance_config(tmpdir: str | Path, **overrides) -> SWEBenchWrapperInstanceConfig:
     """Build a minimal SWEBenchWrapperInstanceConfig for testing."""
     persistent_dir = Path(tmpdir) / "persistent"
     persistent_dir.mkdir(parents=True, exist_ok=True)
@@ -485,6 +486,18 @@ class TestBaseDatasetHarnessProcessor:
 
 
 class TestNodeLocalOpenHandsStaging:
+    def test_runtime_identity_changes_with_runtime_metadata(self, tmp_path: Path) -> None:
+        source = tmp_path / "shared"
+        pyvenv_config = source / "OpenHands" / ".venv" / "pyvenv.cfg"
+        pyvenv_config.parent.mkdir(parents=True)
+        pyvenv_config.write_text("version = A\n")
+        identity_a = swe_app._get_openhands_runtime_identity(source)
+
+        pyvenv_config.write_text("version = B\n")
+        identity_b = swe_app._get_openhands_runtime_identity(source)
+
+        assert identity_a != identity_b
+
     def test_stage_openhands_setup_rewrites_container_paths(self, tmp_path: Path) -> None:
         source = tmp_path / "shared"
         (source / "OpenHands" / ".venv" / "bin").mkdir(parents=True)
@@ -515,6 +528,25 @@ class TestNodeLocalOpenHandsStaging:
 
         assert staged == destination
         copytree.assert_not_called()
+
+    def test_stage_openhands_setup_concurrent_cache_hits_bypass_lock(self, monkeypatch, tmp_path: Path) -> None:
+        source = tmp_path / "shared"
+        source.mkdir()
+        destination = tmp_path / "local"
+        swe_app._stage_openhands_setup(source, destination, "runtime-abc123")
+        lock = MagicMock(side_effect=AssertionError("cache hit entered the staging lock"))
+        monkeypatch.setattr(swe_app, "file_lock", lock)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            staged = list(
+                executor.map(
+                    lambda _: swe_app._stage_openhands_setup(source, destination, "runtime-abc123"),
+                    range(8),
+                )
+            )
+
+        assert staged == [destination] * 8
+        lock.assert_not_called()
 
     def test_stage_openhands_setup_clears_outputs_only_on_fresh_stage(self, tmp_path: Path) -> None:
         source = tmp_path / "shared"
@@ -555,6 +587,10 @@ class TestNodeLocalOpenHandsStaging:
         (bin_dir / "escaped-python").symlink_to(escaped_target)
         binary = b"\x00binary:" + str(source).encode()
         (bin_dir / "binary-tool").write_bytes(binary)
+        opaque_executable = b"\x7fOPAQUE:" + str(source).encode()
+        opaque_executable_path = bin_dir / "opaque-tool"
+        opaque_executable_path.write_bytes(opaque_executable)
+        opaque_executable_path.chmod(0o755)
         untouched = source / "OpenHands" / "config.txt"
         untouched.write_text(f"runtime={source}\n")
         (metadata_dir / "direct_url.json").write_text(f'{{"url": "file://{source}/OpenHands"}}')
@@ -568,6 +604,8 @@ class TestNodeLocalOpenHandsStaging:
         assert os.readlink(staged_bin / "relative-python") == "../../../miniforge3/bin/python"
         assert os.readlink(staged_bin / "escaped-python") == escaped_target
         assert (staged_bin / "binary-tool").read_bytes() == binary
+        assert (staged_bin / "opaque-tool").read_bytes() == opaque_executable
+        assert (staged_bin / "opaque-tool").stat().st_mode & 0o777 == 0o755
         assert (destination / "OpenHands" / "config.txt").read_text() == f"runtime={source}\n"
         assert (
             "/openhands_setup/OpenHands"
@@ -579,7 +617,7 @@ class TestNodeLocalOpenHandsStaging:
     @pytest.mark.parametrize(
         "manifest_content",
         [
-            json.dumps({"schema": 1, "commit": "old", "container_root": "/openhands_setup"}),
+            json.dumps({"schema": 1, "runtime_identity": "old", "container_root": "/openhands_setup"}),
             "{invalid-json",
         ],
     )
@@ -599,7 +637,7 @@ class TestNodeLocalOpenHandsStaging:
         assert (destination / "fresh.txt").read_text() == "fresh"
         assert not (destination / "stale.txt").exists()
         manifest = json.loads((destination / ".nemo_gym_stage.json").read_text())
-        assert manifest["commit"] == "new"
+        assert manifest["runtime_identity"] == "new"
 
 
 ########################################
@@ -1576,10 +1614,11 @@ class TestRunnerRayRemote:
             openhands_setup_dir=shared,
             node_local_openhands_setup_dir=local,
             agent_framework_commit="abc123",
+            openhands_runtime_identity="git:abc123:runtime:test",
         )
 
-        def fake_stage(source_dir: Path, destination_dir: Path, target_commit: str) -> Path:
-            events.append(("stage", source_dir, destination_dir, target_commit))
+        def fake_stage(source_dir: Path, destination_dir: Path, runtime_identity: str) -> Path:
+            events.append(("stage", source_dir, destination_dir, runtime_identity))
             return destination_dir
 
         class FakeRunOpenHandsAgent:
@@ -1599,7 +1638,7 @@ class TestRunnerRayRemote:
         result = runner_ray_remote._function(params.model_dump(mode="python"))
 
         assert result == tmp_path / "report.json"
-        assert events[0] == ("stage", shared, local, "abc123")
+        assert events[0] == ("stage", shared, local, "git:abc123:runtime:test")
         assert events[1][0] == "construct"
 
 
@@ -2434,8 +2473,10 @@ class TestSWEBenchWrapperSetupParams:
         wrapper.config.agent_framework_commit = "commit-abc"
         wrapper.config.openhands_node_local_staging = True
         wrapper.config.openhands_node_local_root = local_root
-        wrapper._swe_bench_wrapper_server_config.openhands_setup_dir = Path("/shared/openhands")
-        wrapper._swe_bench_wrapper_server_config.run_session_id = "session-123"
+        server_config = wrapper._swe_bench_wrapper_server_config
+        assert server_config is not None
+        server_config.openhands_setup_dir = Path("/shared/openhands")
+        server_config.run_session_id = "session-123"
         monkeypatch.setenv("SLURM_JOB_ID", "slurm-456")
         body = NeMoGymResponseCreateParamsNonStreaming(
             model="test-model",
@@ -2453,8 +2494,87 @@ class TestSWEBenchWrapperSetupParams:
         )
 
         params, _ = wrapper._setup_params(body)
+        repeated_params, _ = wrapper._setup_params(body)
 
-        assert params.node_local_openhands_setup_dir == local_root / "23f2aae0932df88d"
+        assert params.openhands_runtime_identity is not None
+        assert params.node_local_openhands_setup_dir is not None
+        assert params.node_local_openhands_setup_dir.parent == local_root
+        assert len(params.node_local_openhands_setup_dir.name) == 16
+        assert repeated_params.node_local_openhands_setup_dir == params.node_local_openhands_setup_dir
+
+    def test_setup_params_mutable_head_change_invalidates_node_local_cache(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper = _create_wrapper(monkeypatch)
+        container_file = tmp_path / "django__django-12345.sif"
+        container_file.touch()
+        source = tmp_path / "shared"
+        openhands_dir = source / "OpenHands"
+        openhands_dir.mkdir(parents=True)
+        version_file = openhands_dir / "version.txt"
+        version_file.write_text("A")
+        swe_app.subprocess_run(["git", "-C", str(openhands_dir), "init", "-q"], check=True)
+        swe_app.subprocess_run(["git", "-C", str(openhands_dir), "add", "version.txt"], check=True)
+        swe_app.subprocess_run(
+            [
+                "git",
+                "-C",
+                str(openhands_dir),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "A",
+            ],
+            check=True,
+        )
+        wrapper.config.container_formatter = [str(tmp_path / "{instance_id}.sif")]
+        wrapper.config.agent_framework_commit = "HEAD"
+        wrapper.config.openhands_node_local_staging = True
+        wrapper.config.openhands_node_local_root = tmp_path / "node-local"
+        server_config = wrapper._swe_bench_wrapper_server_config
+        assert server_config is not None
+        server_config.openhands_setup_dir = source
+        server_config.run_session_id = "session-123"
+        monkeypatch.delenv("SLURM_JOB_ID", raising=False)
+        body = NeMoGymResponseCreateParamsNonStreaming(
+            model="test-model",
+            input=[],
+            temperature=1.0,
+            top_p=1.0,
+            metadata={
+                "problem_statement": "Fix bug",
+                "instance_id": "django__django-12345",
+                "base_commit": "abc123",
+                "dataset_name": "SWE-bench",
+                "split": "test",
+                "instance_dict": json.dumps({"repo": "django/django"}),
+            },
+        )
+        params_a, _ = wrapper._setup_params(body)
+
+        version_file.write_text("B")
+        swe_app.subprocess_run(["git", "-C", str(openhands_dir), "add", "version.txt"], check=True)
+        swe_app.subprocess_run(
+            [
+                "git",
+                "-C",
+                str(openhands_dir),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "B",
+            ],
+            check=True,
+        )
+        params_b, _ = wrapper._setup_params(body)
+
+        assert params_a.node_local_openhands_setup_dir != params_b.node_local_openhands_setup_dir
 
     def test_setup_params_does_not_stage_opencode(self, monkeypatch, tmp_path: Path) -> None:
         wrapper = _create_wrapper(monkeypatch)
@@ -2464,7 +2584,9 @@ class TestSWEBenchWrapperSetupParams:
         wrapper.config.agent_framework = "opencode"
         wrapper.config.openhands_node_local_staging = True
         wrapper.config.openhands_node_local_root = tmp_path / "node-local"
-        wrapper._swe_bench_wrapper_server_config.opencode_setup_dir = tmp_path / "opencode-setup"
+        server_config = wrapper._swe_bench_wrapper_server_config
+        assert server_config is not None
+        server_config.opencode_setup_dir = tmp_path / "opencode-setup"
         monkeypatch.setattr(
             swe_app,
             "get_first_server_config_dict",
