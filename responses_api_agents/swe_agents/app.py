@@ -409,9 +409,7 @@ def _stage_openhands_setup(source_dir: Path, destination_dir: Path, target_commi
         if current_manifest == expected_manifest:
             return destination_dir
 
-        temporary_dir = destination_dir.with_name(
-            f".{destination_dir.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-        )
+        temporary_dir = destination_dir.with_name(f".{destination_dir.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
         try:
             shutil.copytree(source_dir, temporary_dir, symlinks=True)
             _rewrite_openhands_paths(temporary_dir, source_dir)

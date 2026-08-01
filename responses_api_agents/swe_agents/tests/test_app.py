@@ -489,22 +489,18 @@ class TestNodeLocalOpenHandsStaging:
         source = tmp_path / "shared"
         (source / "OpenHands" / ".venv" / "bin").mkdir(parents=True)
         (source / "miniforge3" / "bin").mkdir(parents=True)
-        (source / "OpenHands" / ".venv" / "pyvenv.cfg").write_text(
-            f"home = {source}/miniforge3/bin\n"
-        )
-        (source / "OpenHands" / ".venv" / "bin" / "openhands").write_text(
-            f"#!{source}/OpenHands/.venv/bin/python\n"
-        )
+        (source / "OpenHands" / ".venv" / "pyvenv.cfg").write_text(f"home = {source}/miniforge3/bin\n")
+        (source / "OpenHands" / ".venv" / "bin" / "openhands").write_text(f"#!{source}/OpenHands/.venv/bin/python\n")
         destination = tmp_path / "local"
 
         staged = swe_app._stage_openhands_setup(source, destination, "abc123")
 
         assert staged == destination
-        assert "/openhands_setup/miniforge3/bin" in (
-            destination / "OpenHands" / ".venv" / "pyvenv.cfg"
-        ).read_text()
-        assert (destination / "OpenHands" / ".venv" / "bin" / "openhands").read_text().startswith(
-            "#!/openhands_setup/OpenHands/.venv/bin/python"
+        assert "/openhands_setup/miniforge3/bin" in (destination / "OpenHands" / ".venv" / "pyvenv.cfg").read_text()
+        assert (
+            (destination / "OpenHands" / ".venv" / "bin" / "openhands")
+            .read_text()
+            .startswith("#!/openhands_setup/OpenHands/.venv/bin/python")
         )
 
     def test_stage_openhands_setup_cache_hit_skips_copy(self, monkeypatch, tmp_path: Path) -> None:
@@ -573,9 +569,12 @@ class TestNodeLocalOpenHandsStaging:
         assert os.readlink(staged_bin / "escaped-python") == escaped_target
         assert (staged_bin / "binary-tool").read_bytes() == binary
         assert (destination / "OpenHands" / "config.txt").read_text() == f"runtime={source}\n"
-        assert "/openhands_setup/OpenHands" in (
-            destination / "OpenHands" / ".venv" / "site-packages" / "pkg.dist-info" / "direct_url.json"
-        ).read_text()
+        assert (
+            "/openhands_setup/OpenHands"
+            in (
+                destination / "OpenHands" / ".venv" / "site-packages" / "pkg.dist-info" / "direct_url.json"
+            ).read_text()
+        )
 
     @pytest.mark.parametrize(
         "manifest_content",
@@ -2469,9 +2468,7 @@ class TestSWEBenchWrapperSetupParams:
         monkeypatch.setattr(
             swe_app,
             "get_first_server_config_dict",
-            MagicMock(
-                return_value=MagicMock(host="localhost", port=8000, openai_model="test-model", model=None)
-            ),
+            MagicMock(return_value=MagicMock(host="localhost", port=8000, openai_model="test-model", model=None)),
         )
         body = NeMoGymResponseCreateParamsNonStreaming(
             model="test-model",
