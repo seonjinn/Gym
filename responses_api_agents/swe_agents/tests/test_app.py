@@ -524,6 +524,38 @@ class TestNodeLocalOpenHandsStaging:
 
         assert contract_a != contract_b
 
+    def test_runtime_contract_does_not_treat_parent_git_repo_as_openhands_repo(self, tmp_path: Path) -> None:
+        source = tmp_path / "shared"
+        openhands_dir = source / "OpenHands"
+        openhands_dir.mkdir(parents=True)
+        source_file = openhands_dir / "openhands.py"
+        source_file.write_text("VERSION = 'A'\n")
+        (source / ".gitignore").write_text("OpenHands/\n")
+        swe_app.subprocess_run(["git", "-C", str(source), "init", "-q"], check=True)
+        swe_app.subprocess_run(["git", "-C", str(source), "add", ".gitignore"], check=True)
+        swe_app.subprocess_run(
+            [
+                "git",
+                "-C",
+                str(source),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "parent",
+            ],
+            check=True,
+        )
+        contract_a = swe_app._compute_openhands_runtime_contract_id(source)
+
+        source_file.write_text("VERSION = 'B'\n")
+        contract_b = swe_app._compute_openhands_runtime_contract_id(source)
+
+        assert contract_a != contract_b
+
     @pytest.mark.parametrize("dirt_kind", ["tracked", "untracked"])
     def test_runtime_contract_rejects_dirty_openhands_git_tree(self, dirt_kind: str, tmp_path: Path) -> None:
         source = tmp_path / "shared"

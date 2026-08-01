@@ -409,6 +409,21 @@ def _is_openhands_git_dirt_excluded_path(path: str) -> bool:
 
 def _get_clean_openhands_git_commit(openhands_dir: Path) -> Optional[str]:
     try:
+        root_result = subprocess_run(
+            ["git", "-C", str(openhands_dir), "rev-parse", "--show-toplevel"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if root_result.returncode != 0:
+            return None
+        try:
+            is_openhands_repo = os.path.samefile(root_result.stdout.strip(), openhands_dir)
+        except OSError:
+            return None
+        if not is_openhands_repo:
+            return None
+
         result = subprocess_run(
             ["git", "-C", str(openhands_dir), "rev-parse", "HEAD"],
             check=False,
