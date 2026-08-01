@@ -228,6 +228,27 @@ class TestSWEBenchWrapperConfig:
         assert config.agent_framework_repo is None
         assert config.agent_framework_commit == "HEAD"
 
+    def test_node_local_staging_defaults_off(self) -> None:
+        config = SWEBenchWrapperConfig(
+            host="localhost",
+            port=9003,
+            name="test_agent",
+            entrypoint="responses_api_agents/swe_agents",
+            model_server=ModelServerRef(type="responses_api_models", name="test"),
+        )
+
+        assert config.openhands_node_local_staging is False
+        assert config.openhands_node_local_root == Path("/tmp/nemo_gym_openhands")
+
+    def test_effective_openhands_setup_dir_prefers_node_local(self, tmp_path: Path) -> None:
+        config = _make_instance_config(
+            tmp_path,
+            openhands_setup_dir=tmp_path / "shared",
+            node_local_openhands_setup_dir=tmp_path / "local",
+        )
+
+        assert config.effective_openhands_setup_dir == tmp_path / "local"
+
     def test_custom_values(self) -> None:
         config = SWEBenchWrapperConfig(
             host="localhost",
@@ -2188,6 +2209,72 @@ class TestSWEBenchWrapperSetupParams:
             assert params.eval_command is not None
             assert params.agent_command is not None
             assert params.metrics_fpath.exists()
+
+    def test_setup_params_derives_node_local_openhands_dir(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper = _create_wrapper(monkeypatch)
+        container_file = tmp_path / "django__django-12345.sif"
+        container_file.touch()
+        local_root = tmp_path / "node-local"
+        wrapper.config.container_formatter = [str(tmp_path / "{instance_id}.sif")]
+        wrapper.config.agent_framework_commit = "commit-abc"
+        wrapper.config.openhands_node_local_staging = True
+        wrapper.config.openhands_node_local_root = local_root
+        wrapper._swe_bench_wrapper_server_config.openhands_setup_dir = Path("/shared/openhands")
+        wrapper._swe_bench_wrapper_server_config.run_session_id = "session-123"
+        monkeypatch.setenv("SLURM_JOB_ID", "slurm-456")
+        body = NeMoGymResponseCreateParamsNonStreaming(
+            model="test-model",
+            input=[],
+            temperature=1.0,
+            top_p=1.0,
+            metadata={
+                "problem_statement": "Fix bug",
+                "instance_id": "django__django-12345",
+                "base_commit": "abc123",
+                "dataset_name": "SWE-bench",
+                "split": "test",
+                "instance_dict": json.dumps({"repo": "django/django"}),
+            },
+        )
+
+        params, _ = wrapper._setup_params(body)
+
+        assert params.node_local_openhands_setup_dir == local_root / "23f2aae0932df88d"
+
+    def test_setup_params_does_not_stage_opencode(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper = _create_wrapper(monkeypatch)
+        container_file = tmp_path / "django__django-12345.sif"
+        container_file.touch()
+        wrapper.config.container_formatter = [str(tmp_path / "{instance_id}.sif")]
+        wrapper.config.agent_framework = "opencode"
+        wrapper.config.openhands_node_local_staging = True
+        wrapper.config.openhands_node_local_root = tmp_path / "node-local"
+        wrapper._swe_bench_wrapper_server_config.opencode_setup_dir = tmp_path / "opencode-setup"
+        monkeypatch.setattr(
+            swe_app,
+            "get_first_server_config_dict",
+            MagicMock(
+                return_value=MagicMock(host="localhost", port=8000, openai_model="test-model", model=None)
+            ),
+        )
+        body = NeMoGymResponseCreateParamsNonStreaming(
+            model="test-model",
+            input=[],
+            temperature=1.0,
+            top_p=1.0,
+            metadata={
+                "problem_statement": "Fix bug",
+                "instance_id": "django__django-12345",
+                "base_commit": "abc123",
+                "dataset_name": "SWE-bench",
+                "split": "test",
+                "instance_dict": json.dumps({"repo": "django/django"}),
+            },
+        )
+
+        params, _ = wrapper._setup_params(body)
+
+        assert params.node_local_openhands_setup_dir is None
 
     def test_setup_params_nv_internal(self, monkeypatch) -> None:
         wrapper = _create_wrapper(monkeypatch)

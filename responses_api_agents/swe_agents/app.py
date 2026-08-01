@@ -16,6 +16,7 @@
 import asyncio
 import base64
 import glob
+import hashlib
 import importlib.util
 import json
 import os
@@ -178,6 +179,14 @@ class SWEBenchWrapperConfig(BaseResponsesAPIAgentConfig):
     )
 
     openhands_should_log: bool = False
+    openhands_node_local_staging: bool = Field(
+        default=False,
+        description="Stage the OpenHands runtime on worker-local storage before SWE rollouts.",
+    )
+    openhands_node_local_root: Path = Field(
+        default=Path("/tmp/nemo_gym_openhands"),
+        description="Worker-local root used for staged OpenHands runtimes.",
+    )
     debug: bool = False
 
     opencode_subagents_enabled: bool = Field(
@@ -212,6 +221,7 @@ class ExecuteContainerCommandArgs(BaseModel):
 
 
 class SWEBenchWrapperInstanceConfig(SWEBenchWrapperServerConfig, SWEBenchWrapperConfig):
+    node_local_openhands_setup_dir: Optional[Path] = None
     metrics_fpath: Path
     problem_info: Dict[str, Any]
     body: NeMoGymResponseCreateParamsNonStreaming
@@ -262,6 +272,13 @@ class SWEBenchWrapperInstanceConfig(SWEBenchWrapperServerConfig, SWEBenchWrapper
     @property
     def eval_private_dir(self) -> Path:
         return self.persistent_dir / "eval_private"
+
+    @property
+    def effective_openhands_setup_dir(self) -> Path:
+        setup_dir = self.node_local_openhands_setup_dir or self.openhands_setup_dir
+        if setup_dir is None:
+            raise ValueError("OpenHands setup directory is not set")
+        return setup_dir
 
 
 class SWEBenchMetrics(BaseModel):
@@ -3476,6 +3493,13 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             generation_apptainer_spinup_timestamp_mounted_fpath=base_mounted_dir
             / "generation_apptainer_spinup_timestamp",
         )
+
+        if params.agent_framework == "openhands" and params.openhands_node_local_staging:
+            job_scope = os.environ.get("SLURM_JOB_ID") or self._swe_bench_wrapper_server_config.run_session_id
+            cache_key = hashlib.sha256(
+                f"{job_scope}:{params.agent_framework_commit}:{params.openhands_setup_dir}".encode()
+            ).hexdigest()[:16]
+            params.node_local_openhands_setup_dir = params.openhands_node_local_root / cache_key
 
         params.metrics_fpath.write_text("{}")
 
