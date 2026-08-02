@@ -3168,6 +3168,13 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             mount_args.append(f"--mount type=bind,src={miniforge3_path},dst=/openhands_setup/miniforge3,ro")
             mount_args.append(f"--mount type=bind,src={miniforge3_path},dst={miniforge3_path},ro")
 
+            swe_util_synth = os.environ.get("NRL_SWE_UTIL_SYNTH")
+            instance_id = data_point.get("instance_id")
+            if swe_util_synth and isinstance(instance_id, str):
+                synth_instance_dir = Path(swe_util_synth) / instance_id
+                if synth_instance_dir.is_dir():
+                    mount_args.append(f"--mount type=bind,src={synth_instance_dir},dst=/swe_util,ro")
+
         # Add SWE-bench setup directory mount if available (for evaluation)
         # swe-bench-ext, nv-internal-1, and deepswe don't use the swebench harness
         if command.mode == "eval" and data_point["dataset_name"] not in ("nv-internal-1", "swe-bench-ext", "deepswe"):

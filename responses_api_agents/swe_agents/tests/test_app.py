@@ -1877,6 +1877,46 @@ class TestSWEBenchWrapperBuildApptainerCommand:
             assert "--writable-tmpfs" in result
             assert params.container in result
 
+    def test_mounts_opt_in_synthetic_swe_util_for_instance(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper = _create_wrapper(monkeypatch)
+        params = _make_instance_config(tmp_path)
+        params.persistent_dir.mkdir(parents=True, exist_ok=True)
+        for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
+            (Path(params.openhands_setup_dir) / "OpenHands" / subdir).mkdir(parents=True, exist_ok=True)
+        (Path(params.openhands_setup_dir) / "miniforge3").mkdir(parents=True)
+        synth_instance = tmp_path / "swe_util_synth" / params.problem_info["instance_id"]
+        synth_instance.mkdir(parents=True)
+        monkeypatch.setenv("NRL_SWE_UTIL_SYNTH", str(tmp_path / "swe_util_synth"))
+        command = ExecuteContainerCommandArgs(
+            command="echo hello",
+            expected_file_pattern="/tmp/*.json",
+            mode="agent",
+            timeout=300,
+        )
+
+        result = wrapper._build_apptainer_command(params, command)
+
+        assert f"src={synth_instance},dst=/swe_util,ro" in result
+
+    def test_does_not_mount_missing_synthetic_swe_util(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper = _create_wrapper(monkeypatch)
+        params = _make_instance_config(tmp_path)
+        params.persistent_dir.mkdir(parents=True, exist_ok=True)
+        for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
+            (Path(params.openhands_setup_dir) / "OpenHands" / subdir).mkdir(parents=True, exist_ok=True)
+        (Path(params.openhands_setup_dir) / "miniforge3").mkdir(parents=True)
+        monkeypatch.setenv("NRL_SWE_UTIL_SYNTH", str(tmp_path / "swe_util_synth"))
+        command = ExecuteContainerCommandArgs(
+            command="echo hello",
+            expected_file_pattern="/tmp/*.json",
+            mode="agent",
+            timeout=300,
+        )
+
+        result = wrapper._build_apptainer_command(params, command)
+
+        assert "dst=/swe_util" not in result
+
     def test_eval_mode_swebench_mounts(self, monkeypatch) -> None:
         wrapper = _create_wrapper(monkeypatch)
         with tempfile.TemporaryDirectory() as tmpdir:
