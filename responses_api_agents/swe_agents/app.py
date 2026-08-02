@@ -693,6 +693,39 @@ def _stage_openhands_setup(source_dir: Path, destination_dir: Path, runtime_cont
     return destination_dir
 
 
+def _stage_openhands_setup_with_metrics(source_dir: Path, destination_dir: Path, runtime_contract_id: str) -> Path:
+    """Stage OpenHands and optionally append one timing record."""
+    expected_manifest = {
+        "schema": 1,
+        "runtime_contract_id": runtime_contract_id,
+        "container_root": "/openhands_setup",
+    }
+    reused = _read_openhands_stage_manifest(destination_dir) == expected_manifest
+    started = time.perf_counter()
+    staged = _stage_openhands_setup(source_dir, destination_dir, runtime_contract_id)
+    duration_s = time.perf_counter() - started
+
+    metrics_path_value = os.environ.get("NRL_OH_STAGE_METRICS")
+    if metrics_path_value:
+        metrics_path = Path(metrics_path_value)
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "duration_s": duration_s,
+            "reused": reused,
+            "destination": str(destination_dir),
+            "pid": os.getpid(),
+        }
+        with file_lock(
+            metrics_path,
+            "node-local OpenHands staging metrics",
+            max_wait=300,
+            poll_interval=0.1,
+        ):
+            with metrics_path.open("a") as metrics_file:
+                metrics_file.write(json.dumps(record, sort_keys=True) + "\n")
+    return staged
+
+
 class BaseDatasetHarnessProcessor(BaseModel):
     config: SWEBenchWrapperConfig | SWEBenchWrapperInstanceConfig
 
@@ -2512,7 +2545,7 @@ def runner_ray_remote(params_dict: dict[str, Any]) -> Optional[Path]:
             raise ValueError("Shared OpenHands setup directory is not set")
         if params.openhands_runtime_contract_id is None:
             raise ValueError("OpenHands runtime contract ID is not initialized")
-        _stage_openhands_setup(
+        _stage_openhands_setup_with_metrics(
             params.openhands_setup_dir,
             params.node_local_openhands_setup_dir,
             params.openhands_runtime_contract_id,

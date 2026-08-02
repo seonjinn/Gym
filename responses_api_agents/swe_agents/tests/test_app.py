@@ -622,6 +622,22 @@ class TestNodeLocalOpenHandsStaging:
         assert staged == destination
         copytree.assert_not_called()
 
+    def test_stage_openhands_setup_records_cold_and_reused_durations(self, monkeypatch, tmp_path: Path) -> None:
+        source = tmp_path / "shared"
+        source.mkdir()
+        destination = tmp_path / "local"
+        metrics_path = tmp_path / "stage_metrics.jsonl"
+        runtime_contract_id = swe_app._compute_openhands_runtime_contract_id(source)
+        monkeypatch.setenv("NRL_OH_STAGE_METRICS", str(metrics_path))
+
+        swe_app._stage_openhands_setup_with_metrics(source, destination, runtime_contract_id)
+        swe_app._stage_openhands_setup_with_metrics(source, destination, runtime_contract_id)
+
+        records = [json.loads(line) for line in metrics_path.read_text().splitlines()]
+        assert [record["reused"] for record in records] == [False, True]
+        assert all(record["duration_s"] >= 0 for record in records)
+        assert all(record["destination"] == str(destination) for record in records)
+
     def test_stage_openhands_setup_concurrent_cache_hits_bypass_lock(self, monkeypatch, tmp_path: Path) -> None:
         source = tmp_path / "shared"
         source.mkdir()
