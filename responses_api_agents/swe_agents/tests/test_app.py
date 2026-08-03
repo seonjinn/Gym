@@ -831,6 +831,25 @@ class TestR2EGymDatasetProcessor:
 
 
 class TestOpenHandsHarnessProcessor:
+    def test_setup_returns_resolved_install_prefix(self, monkeypatch, tmp_path: Path) -> None:
+        installed_parent = tmp_path / "installed-parent"
+        openhands_dir = installed_parent / "swe_openhands_setup" / "OpenHands"
+        (openhands_dir / ".venv" / "bin").mkdir(parents=True)
+        (openhands_dir / ".venv" / "bin" / "python").touch()
+        linked_parent = tmp_path / "linked-parent"
+        linked_parent.symlink_to(installed_parent, target_is_directory=True)
+
+        class SymlinkedParentOpenHandsProcessor(OpenHandsHarnessProcessor):
+            @property
+            def parent_dir(self) -> Path:
+                return linked_parent
+
+        config = _make_instance_config(tmp_path)
+        processor = SymlinkedParentOpenHandsProcessor(config=config)
+        monkeypatch.setattr(processor, "_sync_openhands_to_config_commit", MagicMock())
+
+        assert processor.setup() == (installed_parent / "swe_openhands_setup").resolve()
+
     def test_get_run_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = _make_instance_config(tmpdir)
