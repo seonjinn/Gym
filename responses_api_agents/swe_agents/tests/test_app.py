@@ -2380,6 +2380,7 @@ class TestSWEBenchWrapperBuildApptainerCommand:
         for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
             (local / "OpenHands" / subdir).mkdir(parents=True, exist_ok=True)
         (local / "miniforge3").mkdir(parents=True)
+
         command = ExecuteContainerCommandArgs(
             command="echo hello",
             expected_file_pattern="/tmp/*.json",
@@ -2391,6 +2392,36 @@ class TestSWEBenchWrapperBuildApptainerCommand:
 
         assert f"src={local}/OpenHands,dst=/openhands_setup/OpenHands,ro" in result
         assert f"src={shared}/OpenHands" not in result
+
+    def test_mounts_symlinked_openhands_at_install_prefix(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper = _create_wrapper(monkeypatch)
+        params = _make_instance_config(tmp_path)
+        params.persistent_dir.mkdir(parents=True, exist_ok=True)
+
+        installed_setup = tmp_path / "installed-openhands"
+        installed_openhands = installed_setup / "OpenHands"
+        for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
+            (installed_openhands / subdir).mkdir(parents=True, exist_ok=True)
+        installed_miniforge = installed_setup / "miniforge3"
+        installed_miniforge.mkdir(parents=True)
+
+        linked_setup = tmp_path / "linked-openhands"
+        linked_setup.symlink_to(installed_setup, target_is_directory=True)
+        params.openhands_setup_dir = linked_setup
+        command = ExecuteContainerCommandArgs(
+            command="echo hello",
+            expected_file_pattern="/tmp/*.json",
+            mode="agent",
+            timeout=300,
+        )
+
+        result = wrapper._build_apptainer_command(params, command)
+
+        assert f"src={installed_openhands},dst={installed_openhands},ro" in result
+        assert f"src={installed_miniforge},dst={installed_miniforge},ro" in result
+        for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
+            resolved_output = installed_openhands / subdir
+            assert f"src={resolved_output},dst={resolved_output}" in result
 
     def test_mounts_opt_in_synthetic_swe_util_for_instance(self, monkeypatch, tmp_path: Path) -> None:
         wrapper = _create_wrapper(monkeypatch)
