@@ -2442,16 +2442,15 @@ class TestSWEBenchWrapperBuildApptainerCommand:
             resolved_output = installed_openhands / subdir
             assert f"src={resolved_output},dst={resolved_output}" in result
 
-    def test_mounts_opt_in_synthetic_swe_util_for_instance(self, monkeypatch, tmp_path: Path) -> None:
+    def test_mounts_private_swe_util_writable(self, monkeypatch, tmp_path: Path) -> None:
         wrapper = _create_wrapper(monkeypatch)
         params = _make_instance_config(tmp_path)
         params.persistent_dir.mkdir(parents=True, exist_ok=True)
         for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
             (Path(params.openhands_setup_dir) / "OpenHands" / subdir).mkdir(parents=True, exist_ok=True)
         (Path(params.openhands_setup_dir) / "miniforge3").mkdir(parents=True)
-        synth_instance = tmp_path / "swe_util_synth" / params.problem_info["instance_id"]
-        synth_instance.mkdir(parents=True)
-        monkeypatch.setenv("NRL_SWE_UTIL_SYNTH", str(tmp_path / "swe_util_synth"))
+        private_swe_util = params.persistent_dir / "swe_util"
+        private_swe_util.mkdir()
         command = ExecuteContainerCommandArgs(
             command="echo hello",
             expected_file_pattern="/tmp/*.json",
@@ -2461,16 +2460,17 @@ class TestSWEBenchWrapperBuildApptainerCommand:
 
         result = wrapper._build_apptainer_command(params, command)
 
-        assert f"src={synth_instance},dst=/swe_util,ro" in result
+        mount = f"--mount type=bind,src={private_swe_util},dst=/swe_util"
+        assert mount in result
+        assert f"{mount},ro" not in result
 
-    def test_does_not_mount_missing_synthetic_swe_util(self, monkeypatch, tmp_path: Path) -> None:
+    def test_does_not_mount_missing_private_swe_util(self, monkeypatch, tmp_path: Path) -> None:
         wrapper = _create_wrapper(monkeypatch)
         params = _make_instance_config(tmp_path)
         params.persistent_dir.mkdir(parents=True, exist_ok=True)
         for subdir in [".eval_sessions", "logs", "evaluation/oh"]:
             (Path(params.openhands_setup_dir) / "OpenHands" / subdir).mkdir(parents=True, exist_ok=True)
         (Path(params.openhands_setup_dir) / "miniforge3").mkdir(parents=True)
-        monkeypatch.setenv("NRL_SWE_UTIL_SYNTH", str(tmp_path / "swe_util_synth"))
         command = ExecuteContainerCommandArgs(
             command="echo hello",
             expected_file_pattern="/tmp/*.json",
@@ -2761,6 +2761,111 @@ class TestSWEBenchWrapperSetupParams:
             (oh_dir / subdir).mkdir(parents=True, exist_ok=True)
         miniforge = wrapper._swe_bench_wrapper_server_config.openhands_setup_dir / "miniforge3"
         miniforge.mkdir(parents=True, exist_ok=True)
+
+    def _swe_util_case(
+        self, monkeypatch, tmp_path: Path, instance_id: str = "django__django-12345"
+    ) -> tuple[SWEBenchWrapper, NeMoGymResponseCreateParamsNonStreaming]:
+        wrapper = _create_wrapper(monkeypatch)
+        wrapper._swe_bench_wrapper_server_config.base_results_dir = tmp_path / "results"
+        container_file = tmp_path / f"{instance_id}.sif"
+        container_file.touch()
+        wrapper.config.container_formatter = [str(tmp_path / "{instance_id}.sif")]
+        self._setup_oh_dirs(wrapper)
+        body = NeMoGymResponseCreateParamsNonStreaming(
+            model="test-model",
+            input=[],
+            temperature=1.0,
+            top_p=1.0,
+            metadata={
+                "problem_statement": "Fix bug",
+                "instance_id": instance_id,
+                "base_commit": "abc123",
+                "dataset_name": "SWE-bench",
+                "split": "test",
+                "instance_dict": json.dumps(
+                    {
+                        "instance_id": instance_id,
+                        "repo": "django/django",
+                        "patch": "golden patch",
+                        "test_patch": "hidden tests",
+                    }
+                ),
+            },
+        )
+        return wrapper, body
+
+    @staticmethod
+    def _create_swe_util_marker(tmp_path: Path, instance_id: str) -> tuple[Path, Path]:
+        marker_root = tmp_path / "swe_util_synth"
+        marker = marker_root / instance_id
+        marker.mkdir(parents=True)
+        return marker_root, marker
+
+    def test_swe_util_marker_produces_private_writable_mount(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper, body = self._swe_util_case(monkeypatch, tmp_path)
+        marker_root, marker = self._create_swe_util_marker(tmp_path, body.metadata["instance_id"])
+        monkeypatch.setenv("NRL_SWE_UTIL_SYNTH", str(marker_root))
+
+        params, _ = wrapper._setup_params(body)
+
+        private_swe_util = params.persistent_dir / "swe_util"
+        mount = f"--mount type=bind,src={private_swe_util},dst=/swe_util"
+        assert private_swe_util.is_dir()
+        assert mount in params.agent_apptainer_command_str
+        assert f"{mount},ro" not in params.agent_apptainer_command_str
+        assert str(marker) not in params.agent_apptainer_command_str
+
+    def test_swe_util_marker_contents_are_not_copied(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper, body = self._swe_util_case(monkeypatch, tmp_path)
+        marker_root, marker = self._create_swe_util_marker(tmp_path, body.metadata["instance_id"])
+        (marker / "golden_patch.txt").write_text("must stay private")
+        monkeypatch.setenv("NRL_SWE_UTIL_SYNTH", str(marker_root))
+
+        params, _ = wrapper._setup_params(body)
+
+        private_swe_util = params.persistent_dir / "swe_util"
+        assert list(private_swe_util.iterdir()) == []
+        assert (marker / "golden_patch.txt").read_text() == "must stay private"
+
+    def test_swe_util_same_instance_uses_distinct_private_directories(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper, body = self._swe_util_case(monkeypatch, tmp_path)
+        marker_root, _ = self._create_swe_util_marker(tmp_path, body.metadata["instance_id"])
+        monkeypatch.setenv("NRL_SWE_UTIL_SYNTH", str(marker_root))
+
+        first, _ = wrapper._setup_params(body)
+        second, _ = wrapper._setup_params(body)
+
+        first_private = first.persistent_dir / "swe_util"
+        second_private = second.persistent_dir / "swe_util"
+        assert first_private != second_private
+        (first_private / "runtime.json").write_text("first")
+        (second_private / "runtime.json").write_text("second")
+        assert (first_private / "runtime.json").read_text() == "first"
+        assert (second_private / "runtime.json").read_text() == "second"
+
+    def test_swe_util_missing_marker_produces_no_mount(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper, body = self._swe_util_case(monkeypatch, tmp_path)
+        marker_root = tmp_path / "swe_util_synth"
+        marker_root.mkdir()
+        monkeypatch.setenv("NRL_SWE_UTIL_SYNTH", str(marker_root))
+
+        params, _ = wrapper._setup_params(body)
+
+        assert not (params.persistent_dir / "swe_util").exists()
+        assert "dst=/swe_util" not in params.agent_apptainer_command_str
+        assert "dst=/swe_util" not in params.eval_apptainer_command_str
+
+    def test_swe_util_agent_and_eval_reuse_one_private_mount(self, monkeypatch, tmp_path: Path) -> None:
+        wrapper, body = self._swe_util_case(monkeypatch, tmp_path)
+        marker_root, _ = self._create_swe_util_marker(tmp_path, body.metadata["instance_id"])
+        monkeypatch.setenv("NRL_SWE_UTIL_SYNTH", str(marker_root))
+
+        params, _ = wrapper._setup_params(body)
+
+        private_swe_util = params.persistent_dir / "swe_util"
+        mount = f"--mount type=bind,src={private_swe_util},dst=/swe_util"
+        assert params.agent_apptainer_command_str.count(mount) == 1
+        assert params.eval_apptainer_command_str.count(mount) == 1
 
     def test_basic_setup_params(self, monkeypatch) -> None:
         wrapper = _create_wrapper(monkeypatch)

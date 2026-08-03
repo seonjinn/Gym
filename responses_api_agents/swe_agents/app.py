@@ -3566,12 +3566,9 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
             mount_args.append(f"--mount type=bind,src={miniforge3_path},dst=/openhands_setup/miniforge3,ro")
             mount_args.append(f"--mount type=bind,src={miniforge3_path},dst={miniforge3_path},ro")
 
-            swe_util_synth = os.environ.get("NRL_SWE_UTIL_SYNTH")
-            instance_id = data_point.get("instance_id")
-            if swe_util_synth and isinstance(instance_id, str):
-                synth_instance_dir = Path(swe_util_synth) / instance_id
-                if synth_instance_dir.is_dir():
-                    mount_args.append(f"--mount type=bind,src={synth_instance_dir},dst=/swe_util,ro")
+            private_swe_util_dir = params.persistent_dir / "swe_util"
+            if private_swe_util_dir.is_dir():
+                mount_args.append(f"--mount type=bind,src={private_swe_util_dir},dst=/swe_util")
 
         # Add SWE-bench setup directory mount if available (for evaluation)
         # swe-bench-ext, nv-internal-1, and deepswe don't use the swebench harness
@@ -3803,6 +3800,12 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
         instance_dir = f"{instance_id}_{int(time.time() * 1000)}_{str(uuid.uuid4())[:8]}"
         persistent_dir = server_config.base_results_dir / instance_dir
         persistent_dir.mkdir(parents=True, exist_ok=True)
+
+        swe_util_synth = os.environ.get("NRL_SWE_UTIL_SYNTH")
+        if self.config.agent_framework == "openhands" and swe_util_synth and isinstance(instance_id, str):
+            synth_instance_dir = Path(swe_util_synth) / instance_id
+            if synth_instance_dir.is_dir():
+                (persistent_dir / "swe_util").mkdir()
 
         agent_run_id = f"{instance_id}_{int(time.time())}_{str(uuid.uuid4())[:8]}"
 
