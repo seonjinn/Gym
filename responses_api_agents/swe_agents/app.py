@@ -3532,8 +3532,8 @@ class SWEBenchWrapper(SimpleResponsesAPIAgent):
                 )
         else:
             # OpenHands path (default).
-            openhands_setup_dir = params.effective_openhands_setup_dir
-            openhands_dir = f"{openhands_setup_dir}/OpenHands"
+            openhands_setup_dir = params.effective_openhands_setup_dir.resolve()
+            openhands_dir = openhands_setup_dir / "OpenHands"
             mount_args.extend(
                 [
                     # Read-only base mounts (parent first)
