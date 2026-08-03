@@ -374,6 +374,11 @@ _OPENHANDS_GIT_DIRT_EXCLUDED_PATHS = (
     "logs",
     "evaluation/oh",
 )
+_OPENHANDS_EMPTY_PROMPT_MOUNTPOINTS = {
+    "system_prompt.j2",
+    "system_prompt_long_horizon.j2",
+    "user_prompt.j2",
+}
 _OPENHANDS_DISTRIBUTION_METADATA_FILES = (
     "RECORD",
     "METADATA",
@@ -407,6 +412,16 @@ def _is_openhands_git_dirt_excluded_path(path: str) -> bool:
     )
 
 
+def _is_safe_openhands_prompt_mountpoint(openhands_dir: Path, path: str) -> bool:
+    if path not in _OPENHANDS_EMPTY_PROMPT_MOUNTPOINTS:
+        return False
+    try:
+        path_stat = (openhands_dir / path).lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(path_stat.st_mode) and path_stat.st_size == 0
+
+
 def _get_clean_openhands_git_commit(openhands_dir: Path) -> Optional[str]:
     try:
         root_result = subprocess_run(
@@ -434,11 +449,10 @@ def _get_clean_openhands_git_commit(openhands_dir: Path) -> Optional[str]:
             return None
         git_commit = result.stdout.strip()
 
-        dirty_paths: set[str] = set()
+        tracked_dirty_paths: set[str] = set()
         for git_args in (
             ["diff", "--name-only", "-z", "HEAD", "--"],
             ["diff", "--cached", "--name-only", "-z", "HEAD", "--"],
-            ["ls-files", "--others", "--exclude-standard", "--directory", "-z"],
         ):
             dirty_result = subprocess_run(
                 ["git", "-C", str(openhands_dir), *git_args],
@@ -448,11 +462,34 @@ def _get_clean_openhands_git_commit(openhands_dir: Path) -> Optional[str]:
             )
             if dirty_result.returncode != 0:
                 raise RuntimeError(f"Failed to inspect OpenHands Git tree with {' '.join(git_args)}")
-            dirty_paths.update(path for path in dirty_result.stdout.split("\x00") if path)
+            tracked_dirty_paths.update(path for path in dirty_result.stdout.split("\x00") if path)
+
+        untracked_args = ["ls-files", "--others", "--exclude-standard", "-z"]
+        untracked_result = subprocess_run(
+            ["git", "-C", str(openhands_dir), *untracked_args],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if untracked_result.returncode != 0:
+            raise RuntimeError(f"Failed to inspect OpenHands Git tree with {' '.join(untracked_args)}")
+        untracked_dirty_paths = {path for path in untracked_result.stdout.split("\x00") if path}
     except OSError:
         return None
 
-    relevant_dirty_paths = sorted(path for path in dirty_paths if not _is_openhands_git_dirt_excluded_path(path))
+    relevant_dirty_paths = sorted(
+        {
+            path
+            for path in tracked_dirty_paths
+            if not _is_openhands_git_dirt_excluded_path(path)
+        }
+        | {
+            path
+            for path in untracked_dirty_paths
+            if not _is_openhands_git_dirt_excluded_path(path)
+            and not _is_safe_openhands_prompt_mountpoint(openhands_dir, path)
+        }
+    )
     if relevant_dirty_paths:
         preview = ", ".join(relevant_dirty_paths[:5])
         raise RuntimeError(f"OpenHands Git tree is not clean: {preview}")

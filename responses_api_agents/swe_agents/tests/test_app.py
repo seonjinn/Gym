@@ -589,6 +589,118 @@ class TestNodeLocalOpenHandsStaging:
         with pytest.raises(RuntimeError, match="OpenHands Git tree is not clean"):
             swe_app._compute_openhands_runtime_contract_id(source)
 
+    @pytest.mark.parametrize(
+        "prompt_name",
+        ["system_prompt.j2", "system_prompt_long_horizon.j2", "user_prompt.j2"],
+    )
+    def test_runtime_contract_allows_empty_untracked_prompt_mountpoints(
+        self,
+        prompt_name: str,
+        tmp_path: Path,
+    ) -> None:
+        source = tmp_path / "shared"
+        openhands_dir = source / "OpenHands"
+        openhands_dir.mkdir(parents=True)
+        tracked_file = openhands_dir / "openhands.py"
+        tracked_file.write_text("VERSION = 'A'\n")
+        swe_app.subprocess_run(["git", "-C", str(openhands_dir), "init", "-q"], check=True)
+        swe_app.subprocess_run(["git", "-C", str(openhands_dir), "add", "openhands.py"], check=True)
+        swe_app.subprocess_run(
+            [
+                "git",
+                "-C",
+                str(openhands_dir),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+            check=True,
+        )
+        (openhands_dir / prompt_name).touch()
+
+        contract_id = swe_app._compute_openhands_runtime_contract_id(source)
+
+        assert contract_id.startswith("v2:git:")
+
+    @pytest.mark.parametrize("unsafe_kind", ["nonempty", "symlink"])
+    def test_runtime_contract_rejects_unsafe_untracked_prompt_mountpoints(
+        self,
+        unsafe_kind: str,
+        tmp_path: Path,
+    ) -> None:
+        source = tmp_path / "shared"
+        openhands_dir = source / "OpenHands"
+        openhands_dir.mkdir(parents=True)
+        tracked_file = openhands_dir / "openhands.py"
+        tracked_file.write_text("VERSION = 'A'\n")
+        swe_app.subprocess_run(["git", "-C", str(openhands_dir), "init", "-q"], check=True)
+        swe_app.subprocess_run(["git", "-C", str(openhands_dir), "add", "openhands.py"], check=True)
+        swe_app.subprocess_run(
+            [
+                "git",
+                "-C",
+                str(openhands_dir),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+            check=True,
+        )
+        prompt_path = openhands_dir / "system_prompt.j2"
+        if unsafe_kind == "nonempty":
+            prompt_path.write_text("unexpected prompt content\n")
+        else:
+            prompt_path.symlink_to("openhands.py")
+
+        with pytest.raises(RuntimeError, match="OpenHands Git tree is not clean"):
+            swe_app._compute_openhands_runtime_contract_id(source)
+
+    def test_runtime_contract_ignores_gitignored_generated_directories(self, tmp_path: Path) -> None:
+        source = tmp_path / "shared"
+        openhands_dir = source / "OpenHands"
+        openhands_dir.mkdir(parents=True)
+        (openhands_dir / ".gitignore").write_text("generated/**/*\n")
+        tracked_file = openhands_dir / "openhands.py"
+        tracked_file.write_text("VERSION = 'A'\n")
+        swe_app.subprocess_run(["git", "-C", str(openhands_dir), "init", "-q"], check=True)
+        swe_app.subprocess_run(
+            ["git", "-C", str(openhands_dir), "add", ".gitignore", "openhands.py"],
+            check=True,
+        )
+        swe_app.subprocess_run(
+            [
+                "git",
+                "-C",
+                str(openhands_dir),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "initial",
+            ],
+            check=True,
+        )
+        generated_file = openhands_dir / "generated" / "locale.json"
+        generated_file.parent.mkdir()
+        generated_file.write_text("{}\n")
+
+        contract_id = swe_app._compute_openhands_runtime_contract_id(source)
+
+        assert contract_id.startswith("v2:git:")
+
     def test_stage_openhands_setup_rewrites_container_paths(self, tmp_path: Path) -> None:
         source = tmp_path / "shared"
         (source / "OpenHands" / ".venv" / "bin").mkdir(parents=True)
