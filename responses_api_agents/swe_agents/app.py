@@ -1938,7 +1938,7 @@ class OpenHandsHarnessProcessor(BaseDatasetHarnessProcessor):
             if openhands_dir.exists() and Path(openhands_dir / ".venv" / "bin" / "python").exists():
                 print(f"OpenHands already set up at {setup_dir}", flush=True)
                 self._sync_openhands_to_config_commit(openhands_dir)
-                return setup_dir
+                return setup_dir.resolve()
 
             print(f"Setting up OpenHands environment at {setup_dir}...", flush=True)
             rmtree(setup_dir, ignore_errors=True)
@@ -1953,7 +1953,7 @@ AGENT_FRAMEWORK_COMMIT={self.config.agent_framework_commit} \\
     {script_fpath}"""
             self._run_setup_command(command)
 
-            return setup_dir
+            return setup_dir.resolve()
 
     def get_run_command(self) -> ExecuteContainerCommandArgs:
         data_point = self.config.problem_info
